@@ -15,30 +15,9 @@ Modern ML fairness testing tools typically depend on local interpretability meth
 
 ### Workflow
 
-```mermaid
-flowchart TD
-    A[📊 Training Data] --> B[🧠 Train Model]
-    A --> C[📈 Chi-squared Test]
-    C --> D["📊 Feature Importance<br/>(positive &amp; negative)"]
-    
-    D --> E[🌐 Global Discovery<br/>Random Sampling]
-    E --> F[🎯 Genetic Algorithm<br/>Local Search]
-    
-    D --> F
-    
-    F --> G{Discriminatory?<br/>Change sensitive attr.<br/>→ prediction flips?}
-    G -->|Yes| H[✅ Discriminatory Sample]
-    G -->|No| I[❌ Non-discriminatory]
-    
-    I --> F
-    H --> J[📋 Report]
-    
-    style A fill:#e1f5fe
-    style D fill:#fff3e0
-    style F fill:#e8f5e9
-    style H fill:#ffebee
-    style J fill:#f3e5f5
-```
+![ChiGA Workflow](figures/WorkFlow.pdf)
+
+> The full-resolution workflow diagram is available at [`figures/WorkFlow.pdf`](figures/WorkFlow.pdf).
 
 ### Key Features
 
@@ -66,6 +45,8 @@ flowchart TD
 ├── datasets/                       # Raw and processed data files
 │   ├── bank_raw/                   # Bank Marketing raw CSV
 │   └── compas_raw/                 # COMPAS raw CSV
+├── figures/                        # Diagrams
+│   └── WorkFlow.pdf                # ChiGA workflow overview
 ├── utils/                          # Configuration and utilities
 │   ├── config.py                   # Per-dataset feature specs & bounds
 │   └── utils.py                    # Helper functions
@@ -109,31 +90,28 @@ pip install -r requirements.txt
 
 ### Running ChiGA (Chi-squared + Genetic Algorithm)
 
-1. Edit `ChiGA/ChiGA.py` to configure:
-   - `dataset`: one of `"census"`, `"credit"`, `"bank"`, `"compas"`
-   - `sensitive_param`: the sensitive attribute index (see table above)
-   - `classifier_name`: path to the model `.pkl` file
-
-2. Run:
 ```bash
 cd ChiGA
-python ChiGA.py
+python ChiGA.py --dataset credit --sensitive 13 --max-global 1000 --max-local 500000
 ```
 
-The script performs:
-1. **Global Discovery** — randomly samples the input space
-2. **Local Search** — runs the Genetic Algorithm for up to 1 hour, guided by χ² feature importance
-
-Results are saved to a `.npy` file with the discovered discriminatory inputs.
+**Arguments:**
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--dataset` | Dataset: `census`, `credit`, `bank`, `compas` | (required) |
+| `--sensitive` | Sensitive attribute index (see table above) | (required) |
+| `--model` | Path to model `.pkl` file | `../unfair_models/<dataset>/MLP_unfair1.pkl` |
+| `--max-global` | Random samples for global discovery | 1000 |
+| `--max-local` | Max GA iterations for local search | 500000 |
+| `--max-time` | Max runtime in seconds | 3600 |
+| `--output-dir` | Directory to save results | `../results` |
 
 ### Running ExpGA (LIME + GA Baseline)
 
 ```bash
 cd ExpGA
-python ExpGA.py
+python ExpGA.py --dataset credit --sensitive 13 --model ../retrained_models/credit/13/MLP_fair1.pkl
 ```
-
-Similar configuration is needed within the script.
 
 ## How It Works
 
@@ -174,7 +152,7 @@ If you use ChiGA in your research, please cite:
 @inproceedings{chiga2026,
   title     = {One Size Fits All: Ranking Discriminatory Attributes for Fairness Testing without Local Interpreters},
   author    = {Zhao, ...},
-  booktitle = {QSR 2026},
+  booktitle = {QRS 2026},
   year      = {2026}
 }
 ```
