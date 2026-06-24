@@ -1,318 +1,341 @@
+"""
+ExpGA: LIME Explainer-Guided Genetic Algorithm for Fairness Testing (Baseline).
+
+This module implements a fairness testing approach that uses LIME (Local
+Interpretable Model-agnostic Explanations) to identify influential features,
+then uses a Genetic Algorithm to search for discriminatory inputs.
+
+This serves as the baseline comparison for ChiGA, which replaces LIME with
+the simpler and faster Chi-squared feature ranking.
+
+Usage:
+    python ExpGA.py --dataset credit --sensitive 13 --max-global 1000 --max-local 500000
+"""
+
+import argparse
+import random
+import sys
+import time
+from pathlib import Path
+
 import joblib
 import numpy as np
-import random
-import time
-import utils.config
-import sklearn
-from sklearn.feature_selection import chi2
-import lime
 from lime.lime_tabular import LimeTabularExplainer
+
+from Genetic_Algorithm import GA
 from data.bank import bank_data
-from data.credit import credit_data
 from data.census import census_data
 from data.compas import compas_data
-from Genetic_Algorithm import GA
-from utils.config import bank, census, credit, compas
+from data.credit import credit_data
+from utils.config import bank as bank_cfg
+from utils.config import census as census_cfg
+from utils.config import compas as compas_cfg
+from utils.config import credit as credit_cfg
 
-# from keras.models import load_model
-# import signal
-# import keras.backend as K
-# from scipy.spatial.distance import cdist
-# import copy
+# ---------------------------------------------------------------------------
+# Global state (shared across the GA population for deduplication)
+# ---------------------------------------------------------------------------
+global_disc_inputs: set = set()
+global_disc_inputs_list: list = []
+local_disc_inputs: set = set()
+local_disc_inputs_list: list = []
+tot_inputs: set = set()
 
-
-global_disc_inputs = set()
-global_disc_inputs_list = []
-local_disc_inputs = set()
-local_disc_inputs_list = []
-
-
-tot_inputs = set()
-
+# Track which feature rank the sensitive attribute falls into (diagnostic)
 location = np.zeros(21)
 
-# threshold_l = 7  # replace census-7,credit-14,bank-10
-"""
-census: 9,1 for gender, age, 8 for race
-credit: 9,13 for gender,age
-bank:   1 for age
-compas: 1, 2, 3 sex, age, race
-"""
 
-dataset = "compas"
-sensitive_param = 3
+# ---------------------------------------------------------------------------
+# Dataset & configuration registry
+# ---------------------------------------------------------------------------
+DATA_REGISTRY = {
+    "census": (census_cfg, census_data),
+    "credit": (credit_cfg, credit_data),
+    "bank": (bank_cfg, bank_data),
+    "compas": (compas_cfg, compas_data),
+}
 
-data_config = {"census": census, "credit": credit, "bank": bank, "compas": compas}
-threshold_config = {"census": 7, "credit": 14, "bank": 10, "compas": 7}
-threshold_l = threshold_config[dataset]  # replace census-7,credit-14,bank-10
-config = data_config[dataset]  # replace
-threshold = 0
-input_bounds = config.input_bounds
-print(dataset)
-print(input_bounds)
-print(config.feature_name)
-classifier_name = '../ExpGA_fair_models/{}/{}/MLP_fair1.pkl'.format(dataset, sensitive_param)  # replace
-model = joblib.load(classifier_name)
-print(model)
+# Per-dataset threshold for LIME feature-rank filtering
+THRESHOLD_CONFIG = {"census": 7, "credit": 14, "bank": 10, "compas": 7}
 
 
-def ConstructExplainer(train_vectors, feature_names, class_names):
-    explainer = lime.lime_tabular.LimeTabularExplainer(train_vectors, feature_names=feature_names,
-                                                       class_names=class_names, discretize_continuous=False)
-    return explainer
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        description="ExpGA: LIME Explainer-Guided GA for Fairness Testing (Baseline)",
+    )
+    parser.add_argument(
+        "--dataset", type=str, required=True,
+        choices=["census", "credit", "bank", "compas"],
+        help="Dataset to run fairness testing on.",
+    )
+    parser.add_argument(
+        "--sensitive", type=int, required=True,
+        help="Index of the sensitive attribute (see config.py for per-dataset values).",
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Path to the pre-trained fair model (.pkl). "
+             "Default: ../ExpGA_fair_models/<dataset>/<sensitive>/MLP_fair1.pkl",
+    )
+    parser.add_argument(
+        "--max-global", type=int, default=1000,
+        help="Number of random samples for global discovery (default: 1000).",
+    )
+    parser.add_argument(
+        "--max-local", type=int, default=500000,
+        help="Maximum GA iterations for local search (default: 500000).",
+    )
+    parser.add_argument(
+        "--max-time", type=int, default=3600,
+        help="Maximum runtime in seconds (default: 3600).",
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default="../ExpGA_results",
+        help="Directory to save results (default: ../ExpGA_results).",
+    )
+    return parser
 
 
+class GlobalDiscovery:
+    """Generates random seed samples for the global discovery phase."""
 
-def Searchseed(model, feature_names, sens_name, explainer, train_vectors, num, X_ori):
-    seed = []
-    # temp_time = time.time()
-    for x in train_vectors:
-        tot_inputs.add(tuple(x))
-        exp = explainer.explain_instance(x, model.predict_proba, num_features=num)
-
-        # print(time.time() - temp_time, "s", exp)
-
-        explain_labels = exp.available_labels()
-        exp_result = exp.as_list(label=explain_labels[0])
-        rank = []
-        for j in range(len(exp_result)):
-            rank.append(exp_result[j][0])
-        loc = rank.index(sens_name)
-        location[loc] = location[loc] + 1
-        if loc < threshold_l:
-            seed.append(x)
-
-            # imp = []
-            # for item in feature_names:
-            #     pos = rank.index(item)
-            #     imp.append(exp_result[pos][1])
-        if len(seed) >= 200:
-            return seed
-    return seed
-
-
-class Global_Discovery(object):
-    def __init__(self, stepsize=1):
+    def __init__(self, stepsize: int = 1):
         self.stepsize = stepsize
 
-    def __call__(self, iteration, params, input_bounds, sensitive_param):
-        s = self.stepsize
-        random.seed(time.time())
+    def __call__(self, n_samples: int, n_params: int,
+                 bounds: list, sensitive_idx: int) -> list:
         samples = []
-        while len(samples) < iteration:
-            x = np.zeros(params)
-            for i in range(params):
-                x[i] = random.randint(input_bounds[i][0], input_bounds[i][1])
-            x[sensitive_param - 1] = config.input_bounds[sensitive_param - 1][0]
+        random.seed(time.time())
+        while len(samples) < n_samples:
+            x = np.array([
+                random.randint(bounds[i][0], bounds[i][1])
+                for i in range(n_params)
+            ])
+            x[sensitive_idx - 1] = bounds[sensitive_idx - 1][0]
             samples.append(x)
         return samples
 
 
-def evaluate_local(inp):
-    inp_ = [int(i) for i in inp]
+def search_seed(model, feature_names, sens_name, explainer,
+                train_vectors, num_features, threshold_l):
+    """Use LIME explanations to find seed samples for the GA.
+
+    A sample is selected as a seed if the sensitive attribute ranks
+    *above* a threshold in the LIME feature-importance list (i.e., it
+    is considered influential by the local explainer).
+
+    Returns at most 200 seeds.
+    """
+    seeds = []
+    for x in train_vectors:
+        tot_inputs.add(tuple(x))
+        exp = explainer.explain_instance(x, model.predict_proba, num_features=num_features)
+        explain_labels = exp.available_labels()
+        exp_result = exp.as_list(label=explain_labels[0])
+
+        # Find rank of the sensitive feature
+        rank = [item[0] for item in exp_result]
+        loc = rank.index(sens_name)
+        location[loc] += 1
+
+        if loc < threshold_l:
+            seeds.append(x)
+        if len(seeds) >= 200:
+            return seeds
+    return seeds
+
+
+def evaluate_local(inp, model, config, sensitive_param: int, threshold: float = 0):
+    """Fitness function for the Genetic Algorithm.
+
+    Returns
+    -------
+    (fitness, is_discriminatory) : (float, int)
+        fitness is 2 * |pred_diff| + 1 when discriminatory.
+    """
+    inp_ = [int(v) for v in inp]
     inp_[sensitive_param - 1] = int(config.input_bounds[sensitive_param - 1][0])
-    # print(inp_)
     tot_inputs.add(tuple(inp_))
-    pre0 = 0
-    # quit()
-    pre1 = 0
-    for val in range(config.input_bounds[sensitive_param - 1][0], config.input_bounds[sensitive_param - 1][1] + 1):
-        if val != inp_[sensitive_param - 1]:
 
-            inp1 = [int(i) for i in inp_]
-            inp1[sensitive_param - 1] = val
+    lo, hi = config.input_bounds[sensitive_param - 1]
+    for val in range(lo, hi + 1):
+        if val == inp_[sensitive_param - 1]:
+            continue
 
-            inp0 = np.asarray(inp_)
-            inp0 = np.reshape(inp0, (1, -1))
+        inp0 = np.reshape(np.asarray(inp_), (1, -1))
+        inp1 = np.reshape(
+            np.asarray([v if i != sensitive_param - 1 else val
+                         for i, v in enumerate(inp_)]),
+            (1, -1),
+        )
 
-            inp1 = np.asarray(inp1)
-            inp1 = np.reshape(inp1, (1, -1))
+        out0 = model.predict(inp0)
+        out1 = model.predict(inp1)
 
-            out0 = model.predict(inp0)
-            out1 = model.predict(inp1)
+        disc_key = tuple(map(tuple, inp0.tolist()))
+        if (abs(out0 - out1) > threshold
+                and disc_key not in global_disc_inputs
+                and disc_key not in local_disc_inputs):
+            local_disc_inputs.add(disc_key)
+            local_disc_inputs_list.append(inp0.tolist()[0])
+            return 2 * abs(int(out1) - int(out0)) + 1, 1
 
-            # pre0 = model.predict_proba(inp0)[0]
-            # pre1 = model.predict_proba(inp1)[0]
-
-            # print(abs(pre0 - pre1)[0])
-            # quit()
-            # print((tuple(map(tuple, inp0))))
-            if (abs(out0 - out1) > threshold and (tuple(map(tuple, inp0)) not in global_disc_inputs)
-                    and (tuple(map(tuple, inp0)) not in local_disc_inputs)):
-                # print(tuple(map(tuple, inp0)))
-
-                local_disc_inputs.add(tuple(map(tuple, list(inp0))))
-                local_disc_inputs_list.append(inp0.tolist()[0])
-                # print(pre0, pre1)
-                # print(out1, out0)
-
-                return 2 * abs(out1 - out0) + 1
-                # return abs(pre0 - pre1)
-    # return abs(pre0 - pre1)
-    return 2 * abs(out1 - out0) + 1
-
-    # return not abs(out0 - out1) > threshold
-    # for binary classification, we have found that the
-    # following optimization function gives better results
+    return 2 * abs(int(out1) - int(out0)) + 1, 0
 
 
-def xai_fair_testing(max_global, max_local):
-
-    start = time.time()
-    print(dataset, sensitive_param, max_global, max_local, classifier_name)
-
-    data_config = {"census": census, "credit": credit, "bank": bank, "compas": compas}
-    config = data_config[dataset]
+def run_expga(dataset: str, sensitive_param: int, model_path: str,
+              max_global: int, max_local: int, max_time: int,
+              output_dir: str):
+    """Run the full ExpGA fairness-testing pipeline (baseline)."""
+    config, data_loader = DATA_REGISTRY[dataset]
     feature_names = config.feature_name
     class_names = config.class_name
     sens_name = config.sens_name[sensitive_param]
     params = config.params
+    input_bounds = config.input_bounds
+    threshold_l = THRESHOLD_CONFIG[dataset]
 
-    print(sens_name)
-    print(class_names)
-    print(params)
+    print(f"Dataset: {dataset}")
+    print(f"Sensitive attribute: {sensitive_param} ({sens_name})")
+    print(f"Model: {model_path}")
+    print(f"LIME rank threshold: {threshold_l}")
+    print(f"Max global samples: {max_global}, Max local iterations: {max_local}")
+    print(f"Features ({params}): {feature_names}")
+    print(f"Classes: {class_names}")
 
-    data = {"census": census_data, "credit": credit_data, "bank": bank_data, "compas": compas_data}
-    # prepare the testing data and unfair_models
-    X, Y, input_shape, nb_classes = data[dataset]()
+    model = joblib.load(model_path)
 
+    # ------------------------------------------------------------------
+    # Load data
+    # ------------------------------------------------------------------
+    X, Y, _, _ = data_loader()
+
+    # ------------------------------------------------------------------
+    # Global Discovery
+    # ------------------------------------------------------------------
     start = time.time()
+    model_tag = Path(model_path).name.split("_")[0]
 
-    model_name = classifier_name.split("/")[-1].split("_")[0]
-    # file_name = "aequitas_"+dataset+sensitive_param+"_"+unfair_models+""
-    # file_name = "expga_{}_{}{}.txt".format(model_name, dataset, sensitive_param)
-    file_name = "expga_ExpGA_retrain_{}_{}{}_{}_{}_1H.txt".format(model_name, dataset, sensitive_param,
-                                                                  int(max_global / 100),
-                                                                  int(max_local / 100))
-    f = open(file_name, "a")
-    f.write("iter:" + str(iter) + "------------------------------------------" + "\n" + "\n")
-    f.close()
+    output_path = Path(output_dir) / dataset / str(sensitive_param)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    global_discovery = Global_Discovery()
+    log_path = output_path / f"expga_{model_tag}_{dataset}_{sensitive_param}_{max_global // 100}_{max_local // 100}_1H.txt"
+    save_path = output_path / f"local_samples_{model_tag}_expga_{max_global}_1H.npy"
 
-    train_samples = global_discovery(max_global, params, input_bounds, sensitive_param)
-    train_samples = np.array(train_samples)
-    # train_samples = X[np.random.choice(X.shape[0], max_global, replace=False)]
+    with open(log_path, "a") as f:
+        f.write(f"ExpGA run — dataset={dataset} sensitive={sensitive_param} "
+                f"max_global={max_global} max_local={max_local}\n\n")
 
+    global_disco = GlobalDiscovery()
+    train_samples = np.array(
+        global_disco(max_global, params, input_bounds, sensitive_param)
+    )
     np.random.shuffle(train_samples)
+    print(f"Global discovery: {train_samples.shape[0]} samples generated.")
 
-    print(train_samples.shape)
-    explainer = ConstructExplainer(X, feature_names, class_names)
+    # Build LIME explainer
+    explainer = LimeTabularExplainer(
+        X, feature_names=feature_names, class_names=class_names,
+        discretize_continuous=False,
+    )
+    print("LIME explainer constructed.")
 
+    # Search for seeds where sensitive attribute ranks high in LIME
+    print("Searching for seeds via LIME ...")
+    seeds = search_seed(model, feature_names, sens_name, explainer,
+                        train_samples, params, threshold_l)
+    print(f"Found {len(seeds)} seed samples (sensitive rank < {threshold_l}).")
 
-
-    print("-------Explainer Constructed!------")
-    print("-------Searching Seed--------------")
-    seed = Searchseed(model, feature_names, sens_name, explainer, train_samples, params, X)
-
-    print('Finish Searchseed')
-
-    for inp in seed:
-        inp0 = [int(i) for i in inp]
-        inp0 = np.asarray(inp0)
-        inp0 = np.reshape(inp0, (1, -1))
+    for inp in seeds:
+        inp0 = np.reshape(np.asarray([int(v) for v in inp]), (1, -1))
         global_disc_inputs.add(tuple(map(tuple, inp0)))
         global_disc_inputs_list.append(inp0.tolist()[0])
 
-    print("Finished Global Search")
-    # total
-    print('length of total input is:' + str(len(tot_inputs)))
-    # potential
-    print('length of global discovery is:' + str(len(global_disc_inputs_list)))
+    print(f"Global discovery: {len(global_disc_inputs_list)} candidates "
+          f"(LIME rank < {threshold_l}).")
+    print(f"LIME rank distribution: {location[:params]}")
 
-    end = time.time()
+    # ------------------------------------------------------------------
+    # Genetic Algorithm Local Search
+    # ------------------------------------------------------------------
+    print("\nStarting Genetic Algorithm local search ...")
+    ga = GA(
+        nums=global_disc_inputs_list,
+        bound=input_bounds,
+        func=lambda x: evaluate_local(x, model, config, sensitive_param),
+        DNA_SIZE=len(input_bounds),
+        cross_rate=0.9,
+        mutation=0.05,
+    )
 
-    print('Total time:' + str(end - start))
+    checkpoint_interval = 300
+    next_checkpoint = checkpoint_interval
 
-    print("")
-    print("Starting Local Search")
-
-    '''
-    ------------------------------------
-              Genetic Algorithm
-    ------------------------------------
-    '''
-
-    nums = global_disc_inputs_list
-    DNA_SIZE = len(input_bounds)
-    cross_rate = 0.9
-    mutation = 0.05
-    iteration = max_local
-    ga = GA(nums=nums, bound=input_bounds, func=evaluate_local, DNA_SIZE=DNA_SIZE, cross_rate=cross_rate,
-            mutation=mutation)
-    # for random
-
-
-    count = 300
-    for i in range(iteration):
+    for i in range(max_local):
         ga.evolution()
-        end = time.time()
-        use_time = end - start
-        if use_time >= count:
-            f = open(file_name, "a")
-            f.write("Percentage discriminatory inputs - " + str(
-                float(len(global_disc_inputs_list) + len(local_disc_inputs_list))
-                / float(len(tot_inputs)) * 100) + "\n")
-            f.write("Number of discriminatory inputs are " + str(len(local_disc_inputs_list)) + "\n")
-            f.write("Total Inputs are " + str(len(tot_inputs)) + "\n")
-            f.write('use time:' + str(end - start) + "\n" + "\n")
-            f.close()
+        elapsed = time.time() - start
 
-            print("Percentage discriminatory inputs - " + str(float(len(local_disc_inputs_list))
-                                                              / float(len(tot_inputs)) * 100))
-            print("Number of discriminatory inputs are " + str(len(local_disc_inputs_list)))
-            print("Total Inputs are " + str(len(tot_inputs)) + "\n")
-
-            print('use time:' + str(end - start))
-            print("Epoch ", i, " / ", iteration)
-            count += 300
+        if elapsed >= next_checkpoint:
+            pct = (len(global_disc_inputs_list) + len(local_disc_inputs_list)) / max(len(tot_inputs), 1) * 100
+            with open(log_path, "a") as f:
+                f.write(f"Percentage discriminatory inputs - {pct:.4f}\n")
+                f.write(f"Number of discriminatory inputs are {len(local_disc_inputs_list)}\n")
+                f.write(f"Total Inputs are {len(tot_inputs)}\n")
+                f.write(f"Use time: {elapsed:.1f}s\n\n")
+            print(f"[{elapsed:.0f}s] Discriminatory: {len(local_disc_inputs_list)} "
+                  f"/ {len(tot_inputs)} ({pct:.2f}%)")
+            next_checkpoint += checkpoint_interval
 
         if i % 300 == 0:
-            print("Epochs :", i)
-            print('use time:' + str(end - start))
-            print("Total Inputs are " + str(len(tot_inputs)))
-            print("Number of discriminatory inputs are " + str(len(local_disc_inputs_list)))
-            print("Percentage discriminatory inputs - " + str(
-                float(len(local_disc_inputs_list)) / float(len(tot_inputs)) * 100))
+            pct = len(local_disc_inputs_list) / max(len(tot_inputs), 1) * 100
+            print(f"Epoch {i}: {len(local_disc_inputs_list)} discriminatory "
+                  f"/ {len(tot_inputs)} total ({pct:.2f}%) — {elapsed:.0f}s")
 
-        if use_time >= 3600:
-            print("---------------FINISH-----------------")
-            f = open(file_name, "a")
-            f.write("-------------FINISH------------------")
-            f.write("Percentage discriminatory inputs - " + str(
-                float(len(global_disc_inputs_list) + len(local_disc_inputs_list))
-                / float(len(tot_inputs)) * 100) + "\n")
-            f.write("Number of discriminatory inputs are " + str(len(local_disc_inputs_list)) + "\n")
-            f.write("Total Inputs are " + str(len(tot_inputs)) + "\n")
-            f.write('use time:' + str(end - start) + "\n" + "\n")
-            f.write("-------------FINISH------------------")
-            f.close()
-            print("Epochs :", i)
-            print('use time:' + str(end - start))
-            print("Total Inputs are " + str(len(tot_inputs)))
-            print("Number of discriminatory inputs are " + str(len(local_disc_inputs_list)))
-            print("Percentage discriminatory inputs - " + str(
-                float(len(local_disc_inputs_list)) / float(len(tot_inputs)) * 100))
-            print(dataset, sensitive_param, model_name)
-            print("---------------FINISH-----------------")
-            np.save(
-                '../ExpGA_results/' + dataset + '/{}/local_samples_{}_expga_{}_1H.npy'.format(sensitive_param, model_name,
-                                                                                        max_global),
-                np.array(local_disc_inputs_list))
-
+        if elapsed >= max_time:
+            pct = (len(global_disc_inputs_list) + len(local_disc_inputs_list)) / max(len(tot_inputs), 1) * 100
+            with open(log_path, "a") as f:
+                f.write("-------------FINISH------------------\n")
+                f.write(f"Percentage discriminatory inputs - {pct:.4f}\n")
+                f.write(f"Number of discriminatory inputs are {len(local_disc_inputs_list)}\n")
+                f.write(f"Total Inputs are {len(tot_inputs)}\n")
+                f.write(f"Use time: {elapsed:.1f}s\n")
+                f.write(f"Saved to: {save_path}\n")
+            np.save(str(save_path), np.array(local_disc_inputs_list))
+            print(f"\nFinished! Results saved to {save_path}")
+            print(f"  {len(local_disc_inputs_list)} discriminatory samples found "
+                  f"out of {len(tot_inputs)} total ({pct:.2f}%)")
             return
 
-    np.save(
-        '../results/' + dataset + '/{}/local_samples_{}_expga_{}.npy'.format(sensitive_param, model_name, max_global),
-        np.array(local_disc_inputs_list))
-
-    # print("Total Inputs are " + str(len(tot_inputs)))
-    # print("Number of discriminatory inputs are " + str(len(local_disc_inputs_list)))
+    np.save(str(save_path), np.array(local_disc_inputs_list))
+    print(f"Results saved to {save_path}")
 
 
 def main(argv=None):
-    xai_fair_testing(max_global=1000, max_local=500000)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.model is None:
+        args.model = f"../ExpGA_fair_models/{args.dataset}/{args.sensitive}/MLP_fair1.pkl"
+
+    # Clear global state for a fresh run
+    global_disc_inputs.clear()
+    global_disc_inputs_list.clear()
+    local_disc_inputs.clear()
+    local_disc_inputs_list.clear()
+    tot_inputs.clear()
+    location.fill(0)
+
+    run_expga(
+        dataset=args.dataset,
+        sensitive_param=args.sensitive,
+        model_path=args.model,
+        max_global=args.max_global,
+        max_local=args.max_local,
+        max_time=args.max_time,
+        output_dir=args.output_dir,
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
